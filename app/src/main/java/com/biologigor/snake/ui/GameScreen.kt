@@ -6,8 +6,10 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -32,6 +34,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,6 +48,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -60,6 +64,7 @@ import com.biologigor.snake.data.Settings
 import com.biologigor.snake.fx.Beeper
 import com.biologigor.snake.fx.Haptics
 import com.biologigor.snake.game.Dir
+import com.biologigor.snake.game.Difficulty
 import com.biologigor.snake.game.Engine
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -88,20 +93,21 @@ fun GameScreen() {
     var screen by remember { mutableStateOf<Screen>(Screen.Menu) }
     var engine by remember { mutableStateOf<Engine?>(null) }
     var frame by remember { mutableLongStateOf(0L) }
+    var stepT by remember { mutableFloatStateOf(0f) }
     var newBest by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var levelBanner by remember { mutableStateOf<Int?>(null) }
 
     fun startGame() {
-        engine = Engine.new(COLS, ROWS)
+        engine = Engine.new(COLS, ROWS, settings.difficulty)
         newBest = false
         levelBanner = null
         screen = Screen.Running
     }
 
     fun finishGame(e: Engine) {
-        if (e.score > settings.best) {
-            settings = settings.copy(best = e.score)
+        if (e.score > settings.best(e.difficulty)) {
+            settings = settings.withBest(e.difficulty, e.score)
             prefs.save(settings)
             newBest = true
         }
@@ -142,6 +148,8 @@ fun GameScreen() {
     // Игровой цикл: один проход на кадр, шаги движка — по его таймеру
     LaunchedEffect(screen) {
         if (screen != Screen.Running) return@LaunchedEffect
+        // После паузы стартуем с текущего места, без рывка назад
+        engine?.syncPrevSnake()
         var lastNs = withFrameNanos { it }
         var acc = 0L
         while (screen == Screen.Running) {
@@ -164,6 +172,8 @@ fun GameScreen() {
                 if (e.level > levelBefore) justLevelUp = true
                 if (!e.alive) justDied = true
             }
+            // Доля пройденного шага: 0 — только что тикнули, 1 — почти следующий
+            stepT = if (e.alive) (acc / (e.delayMs * 1_000_000f)).coerceIn(0f, 1f) else 1f
             frame = now
             if (justAte) {
                 if (settings.sound) beeper.eat()
@@ -207,7 +217,7 @@ fun GameScreen() {
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    text = "Рекорд: ${settings.best}",
+                    text = "Рекорд: ${settings.best(engine?.difficulty ?: settings.difficulty)}",
                     color = TextDim,
                     fontSize = 12.sp,
                 )
@@ -249,6 +259,7 @@ fun GameScreen() {
             BoardCanvas(
                 engine = engine,
                 frame = frame,
+                stepT = stepT,
                 modifier = Modifier.fillMaxSize(),
             )
 
@@ -261,7 +272,8 @@ fun GameScreen() {
                     )
                 } else {
                     MenuPanel(
-                        best = settings.best,
+                        difficulty = settings.difficulty,
+                        best = settings.best(settings.difficulty),
                         onPlay = ::startGame,
                         onSettings = { showSettings = true },
                     )
@@ -319,16 +331,17 @@ fun GameScreen() {
 private fun BoardCanvas(
     engine: Engine?,
     frame: Long,
+    stepT: Float,
     modifier: Modifier = Modifier,
 ) {
     // Управление только кнопкой, жестов на поле нет
     Canvas(modifier = modifier) {
         // Чтение frame в draw и есть подписка на перерисовку: меняем его каждый кадр
-        drawBoard(engine, frame)
+        drawBoard(engine, frame, stepT)
     }
 }
 
-private fun DrawScope.drawBoard(engine: Engine?, frame: Long) {
+private fun DrawScope.drawBoard(engine: Engine?, frame: Long, stepT: Float) {
     val cell = min(size.width / COLS, size.height / ROWS)
     val boardW = cell * COLS
     val boardH = cell * ROWS
@@ -399,37 +412,78 @@ private fun DrawScope.drawBoard(engine: Engine?, frame: Long) {
         )
     }
 
-    // Змея: от хвоста к голове, голова рисуется поверх
-    val snake = engine.snake
-    for (i in snake.indices.reversed()) {
-        val p = snake[i]
-        val t = if (snake.size > 1) i.toFloat() / (snake.size - 1) else 0f
-        val color = lerp(SnakeHead, SnakeTail, t)
-        drawRoundRect(
-            color = color,
-            topLeft = Offset(ox + p.x * cell + inset, oy + p.y * cell + inset),
-            size = Size(cell - 2 * inset, cell - 2 * inset),
-            cornerRadius = corner,
-        )
-    }
+    // Змея и глаза — срезаются по рамке поля: при сквозных стенах сегмент
+    // уезжает за один край и доезжает с другого, там рисуется его копия
+    clipRect(ox, oy, ox + boardW, oy + boardH) {
+        // Змея: от хвоста к голове, голова рисуется поверх.
+        // Между тиками сегменты скользят от прошлой клетки к новой.
+        val snake = engine.snake
+        val prevSnake = engine.prevSnake
+        for (i in snake.indices.reversed()) {
+            val cur = snake[i]
+            val prev = prevSnake.getOrNull(i) ?: cur
+            val x = lerpCell(prev.x, cur.x, stepT, COLS)
+            val y = lerpCell(prev.y, cur.y, stepT, ROWS)
+            val k = if (snake.size > 1) i.toFloat() / (snake.size - 1) else 0f
+            val color = lerp(SnakeHead, SnakeTail, k)
+            for ((cx, cy) in cellCopies(x, y)) {
+                drawRoundRect(
+                    color = color,
+                    topLeft = Offset(ox + cx * cell + inset, oy + cy * cell + inset),
+                    size = Size(cell - 2 * inset, cell - 2 * inset),
+                    cornerRadius = corner,
+                )
+            }
+        }
 
-    // Глаза на голове, смотрят по направлению движения
-    val h = snake.first()
-    val hcx = ox + (h.x + 0.5f) * cell
-    val hcy = oy + (h.y + 0.5f) * cell
-    val off = cell * 0.17f
-    val eyeR = cell * 0.09f
-    val pupilR = eyeR * 0.55f
-    val fwdX = engine.dir.dx * off
-    val fwdY = engine.dir.dy * off
-    val perpX = if (engine.dir.dx != 0) 0f else -off
-    val perpY = if (engine.dir.dy != 0) 0f else -off
-    for (s in intArrayOf(1, -1)) {
-        val cx = hcx + fwdX + perpX * s
-        val cy = hcy + fwdY + perpY * s
-        drawCircle(Color.White, eyeR, Offset(cx, cy))
-        drawCircle(Color(0xFF0E141B), pupilR, Offset(cx + engine.dir.dx * eyeR * 0.4f, cy + engine.dir.dy * eyeR * 0.4f))
+        // Глаза на голове, смотрят по направлению движения
+        val head = snake.first()
+        val headPrev = prevSnake.getOrNull(0) ?: head
+        val hx = lerpCell(headPrev.x, head.x, stepT, COLS)
+        val hy = lerpCell(headPrev.y, head.y, stepT, ROWS)
+        val off = cell * 0.17f
+        val eyeR = cell * 0.09f
+        val pupilR = eyeR * 0.55f
+        val fwdX = engine.dir.dx * off
+        val fwdY = engine.dir.dy * off
+        val perpX = if (engine.dir.dx != 0) 0f else -off
+        val perpY = if (engine.dir.dy != 0) 0f else -off
+        for ((ccx, ccy) in cellCopies(hx, hy)) {
+            val hcx = ox + (ccx + 0.5f) * cell
+            val hcy = oy + (ccy + 0.5f) * cell
+            for (s in intArrayOf(1, -1)) {
+                val ex = hcx + fwdX + perpX * s
+                val ey = hcy + fwdY + perpY * s
+                drawCircle(Color.White, eyeR, Offset(ex, ey))
+                drawCircle(
+                    Color(0xFF0E141B),
+                    pupilR,
+                    Offset(ex + engine.dir.dx * eyeR * 0.4f, ey + engine.dir.dy * eyeR * 0.4f),
+                )
+            }
+        }
     }
+}
+
+/**
+ * Плавная координата клетки между тиками. Переход через край поля
+ * (сквозные стены) идёт по короткой дуге — за соседний край, а не через всё поле.
+ */
+private fun lerpCell(prev: Int, cur: Int, stepT: Float, n: Int): Float {
+    var d = cur - prev
+    if (d > 1 || d < -1) {
+        if (d > n / 2) d -= n else if (d < -n / 2) d += n
+    }
+    return prev + d * stepT
+}
+
+/** Клетка и её копия с противоположного края, если сегмент пересекает границу поля. */
+private fun cellCopies(x: Float, y: Float): List<Pair<Float, Float>> = buildList {
+    add(x to y)
+    if (x < 0) add((x + COLS) to y)
+    if (x > COLS - 1) add((x - COLS) to y)
+    if (y < 0) add(x to (y + ROWS))
+    if (y > ROWS - 1) add(x to (y - ROWS))
 }
 
 // ---------------------------------------------------------------- панели-оверлеи
@@ -453,7 +507,12 @@ private fun OverlayPanel(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun MenuPanel(best: Int, onPlay: () -> Unit, onSettings: () -> Unit) {
+private fun MenuPanel(
+    difficulty: Difficulty,
+    best: Int,
+    onPlay: () -> Unit,
+    onSettings: () -> Unit,
+) {
     OverlayPanel {
         Text("ЗМЕЙКА", color = Accent, fontSize = 40.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.size(8.dp))
@@ -463,6 +522,8 @@ private fun MenuPanel(best: Int, onPlay: () -> Unit, onSettings: () -> Unit) {
             fontSize = 13.sp,
         )
         Spacer(Modifier.size(16.dp))
+        Text("Сложность: ${difficulty.label}", color = TextDim, fontSize = 13.sp)
+        Spacer(Modifier.size(4.dp))
         Text("Рекорд: $best", color = TextMain, fontSize = 16.sp)
         Spacer(Modifier.size(20.dp))
         Button(
@@ -532,6 +593,36 @@ private fun SettingsPanel(
         Spacer(Modifier.size(14.dp))
         SettingRow("Звук", settings.sound) { onChange(settings.copy(sound = it)) }
         SettingRow("Вибрация", settings.vibration) { onChange(settings.copy(vibration = it)) }
+        Spacer(Modifier.size(14.dp))
+        Text("Сложность", color = TextMain, fontSize = 16.sp)
+        Spacer(Modifier.size(6.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Difficulty.values().forEach { d ->
+                val selected = d == settings.difficulty
+                if (selected) {
+                    Button(
+                        onClick = { onChange(settings.copy(difficulty = d)) },
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 4.dp),
+                    ) { Text(d.label, fontSize = 13.sp) }
+                } else {
+                    OutlinedButton(
+                        onClick = { onChange(settings.copy(difficulty = d)) },
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 4.dp),
+                    ) { Text(d.label, color = TextDim, fontSize = 13.sp) }
+                }
+            }
+        }
+        Spacer(Modifier.size(4.dp))
+        Text(
+            "Влияет на разгон скорости, рекорд у каждой свой",
+            color = TextDim,
+            fontSize = 12.sp,
+        )
         Spacer(Modifier.size(14.dp))
         Button(onClick = onClose) { Text("Готово") }
     }

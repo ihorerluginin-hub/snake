@@ -1,5 +1,7 @@
 package com.biologigor.snake.game
 
+import kotlin.math.pow
+import kotlin.math.roundToLong
 import kotlin.random.Random
 
 /** Направление движения и приращение клетки. */
@@ -14,6 +16,21 @@ enum class Dir(val dx: Int, val dy: Int) {
 data class Pos(val x: Int, val y: Int)
 
 /**
+ * Шкала сложности. Стартовая скорость и потолок одинаковы для всех, отличается
+ * разгон: за один уровень змейка ускоряется в [Difficulty.levelSpeedFactor]
+ * раза относительно скорости в начале этого уровня.
+ */
+enum class Difficulty(
+    val label: String,
+    /** Во сколько раз змейка быстрее к концу уровня, чем в его начале. */
+    val levelSpeedFactor: Double,
+) {
+    EASY("Легко", 1.5),
+    MEDIUM("Средне", 2.0),
+    HARD("Сложно", 3.0),
+}
+
+/**
  * Чистая игровая логика: без Android-зависимостей, один шаг — один [tick].
  *
  * Змея хранится списком от головы к хвосту. Повороты складываются в очередь,
@@ -23,13 +40,18 @@ data class Pos(val x: Int, val y: Int)
  * уровни — поле с границей (стены убивают), чётные — сквозные стены и
  * препятствия, их раскладки чередуются от уровня к уровню. Кроме обычных
  * яблок есть красный бонус: +[BONUS_SCORE] очков, но живёт только
- * [BONUS_TTL_MS] миллисекунд.
+ * [BONUS_TTL_MS] миллисекунд. Скорость разгона зависит от [difficulty].
  */
 class Engine private constructor(
     val cols: Int,
     val rows: Int,
+    val difficulty: Difficulty,
 ) {
     var snake: List<Pos> = emptyList()
+        private set
+
+    /** Змейка до последнего [tick] — по ней рисуется плавное движение. */
+    var prevSnake: List<Pos> = emptyList()
         private set
     var dir: Dir = Dir.RIGHT
         private set
@@ -58,9 +80,15 @@ class Engine private constructor(
     var won: Boolean = false
         private set
 
-    /** Задержка между шагами, мс. Уменьшается с каждым съеденным яблоком и уровнем. */
-    var delayMs: Long = START_DELAY_MS
-        private set
+    /** Задержка между шагами, мс. Уменьшается с каждым съеденным яблоком. */
+    val delayMs: Long
+        get() = delay.roundToLong()
+
+    /** Точная задержка без округлений — чтобы разгон не плыл от накопления ошибок. */
+    private var delay: Double = START_DELAY_MS.toDouble()
+
+    /** Множитель задержки за каждое яблоко: за уровень даёт [Difficulty.levelSpeedFactor]. */
+    private val appleFactor = difficulty.levelSpeedFactor.pow(1.0 / POINTS_PER_LEVEL)
 
     /** Сквозные стены на чётных уровнях. */
     val wrap: Boolean get() = level % 2 == 0
@@ -73,9 +101,15 @@ class Engine private constructor(
         if (turnQueue.size < MAX_QUEUED_TURNS) turnQueue.addLast(d)
     }
 
+    /** Зафиксировать текущую позицию как точку отсчёта отрисовки (после паузы). */
+    fun syncPrevSnake() {
+        prevSnake = snake
+    }
+
     /** Один шаг игры. Меняет состояние на месте. */
     fun tick() {
         if (!alive) return
+        prevSnake = snake
         val nd = if (turnQueue.isEmpty()) dir else turnQueue.removeFirst()
         dir = nd
 
@@ -106,7 +140,7 @@ class Engine private constructor(
             score++
             food = spawnFood()
             if (!alive) return // поле заполнено — победа
-            delayMs = (delayMs - SPEEDUP_MS).coerceAtLeast(MIN_DELAY_MS)
+            delay = (delay / appleFactor).coerceAtLeast(MIN_DELAY_MS.toDouble())
             maybeSpawnBonus()
         } else {
             snake = snake.dropLast(1)
@@ -128,11 +162,11 @@ class Engine private constructor(
     private fun levelUp() {
         level++
         resetSnake()
+        prevSnake = snake // телепорт на новый уровень — интерполяции быть не должно
         obstacles = buildObstacles()
         if (snake.any { it == food }) food = spawnFood()
         bonus = null
         bonusTtlMs = 0
-        delayMs = (delayMs - LEVEL_SPEEDUP_MS).coerceAtLeast(MIN_DELAY_MS)
     }
 
     /** Сброс змейки к начальной длине и позиции в центре поля. */
@@ -229,10 +263,9 @@ class Engine private constructor(
     }
 
     companion object {
-        const val START_DELAY_MS = 220L
+        // Стартовая задержка: в 1,5 раза быстрее прежних 440 мс
+        const val START_DELAY_MS = 293L
         const val MIN_DELAY_MS = 90L
-        const val SPEEDUP_MS = 6L
-        const val LEVEL_SPEEDUP_MS = 12L
         const val POINTS_PER_LEVEL = 20
         const val BONUS_SCORE = 5
         const val BONUS_TTL_MS = 10_000L
@@ -241,11 +274,12 @@ class Engine private constructor(
         private const val START_LENGTH = 3
         private const val HEAD_CLEARANCE = 6
 
-        fun new(cols: Int, rows: Int): Engine {
-            val e = Engine(cols, rows)
+        fun new(cols: Int, rows: Int, difficulty: Difficulty = Difficulty.MEDIUM): Engine {
+            val e = Engine(cols, rows, difficulty)
             val cx = cols / 2
             val cy = rows / 2
             e.snake = (0 until START_LENGTH).map { Pos(cx - it, cy) }
+            e.prevSnake = e.snake
             e.dir = Dir.RIGHT
             e.food = e.spawnFood()
             return e
